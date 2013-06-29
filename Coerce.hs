@@ -1,4 +1,4 @@
-{-# LANGUAGE ConstraintKinds, DataKinds, TypeFamilies, MultiParamTypeClasses, TypeOperators, PolyKinds, UndecidableInstances, FlexibleInstances, ScopedTypeVariables #-}
+{-# LANGUAGE ConstraintKinds, DataKinds, TypeFamilies, MultiParamTypeClasses, TypeOperators, PolyKinds, UndecidableInstances, FlexibleInstances, ScopedTypeVariables, FunctionalDependencies #-}
 module Coerce where
 
 import qualified Data.Typeable as T (typeOf, mkTyCon3)
@@ -15,8 +15,9 @@ import Unsafe.Coerce
   Let's take the Prelude.replicate function as an example:
   replicate :: Int -> a -> [a]
 
-  A ground representation of this type would be
+  A ground representation of this function would be
   replicate' :: G Int -> ANY -> G1 [] ANY
+  replicate' (G i) = G . replicate i
 
   This can be safely coerced back into the original type:
   replicate = coerceAny replicate'
@@ -53,7 +54,7 @@ import Unsafe.Coerce
   replicate'' :: a -> ANY -> G1 [] ANY
 
   Internally there is no way to tell whether 'a' is going to be
-  intantiated into ANY or some other type. We could use
+  instantiated into ANY or some other type. We could use
   -XOverlappingInstances as well to disallow this type, but we want to
   avoid that extension.
 
@@ -63,6 +64,29 @@ import Unsafe.Coerce
   This still works, because although 'a' is left
   "Haskell-polymorphic", we know it will be a ground type that we want
   to get back after the coercion.
+
+  (!!!)
+  Note that this way of tagging also allows the following type:
+  weird :: ANY -> G ANY
+  weird a = G a
+
+  This is unsafe, as we treat ANY as both a polymorphic tag -and- a
+  ground type! If we coerce this we will get:
+  wrong :: a -> ANY
+  This type should not be inhabited, as ANY ~= empty type!
+
+  The constraints generated in this module are not enough to disallow
+  this! We would need some way of expressing non-equality, and for that
+  we need -XOverlappingInstances again (consider ANY -> G a).
+
+  This does not mean we cannot use ANY as a ground type, but we have
+  to be careful and use it either only as a polymorphic tag or only as a
+  ground type. The following is safe:
+  safe :: G ANY -> G2 Either (G ANY) ANY1
+  safe = Left
+  works :: ANY -> Either ANY a
+  works = coerceAny safe
+  (/!!!)
 
   Limitations:
 
@@ -85,6 +109,7 @@ import Unsafe.Coerce
       TyCon :: (* -> *) -> * -> * then we cannot write
       (GK TyCon [G Maybe(?), G Char]), however we CAN write
       (GK (TyCon Maybe) [G Char]) which will behave as expected.
+  * If we treat the polymorphic tags
 
   Question: Why would anyone need this?
   Answer: In general you want such a coercion if your program needs a
@@ -93,20 +118,16 @@ import Unsafe.Coerce
   hide functions and later dynamicallly cast them back. If you want to
   store polymorphic functions you need such a representation.
 
-  Question: Ok. Let's say I want to store replicate. How would I go
-  about it?
-  
-
 |-}
 
-class CoerceAny f g where
-    coerceAny :: f -> g
-
-instance (PolyOf f g) => CoerceAny f g where
+class CoerceAny g p where
     -- | coerces a ground represented polymorphic function back into a polymorphic one
+    coerceAny :: g -> p
+
+instance (PolyOf g p) => CoerceAny g p where
     coerceAny = unsafeCoerce
 
-newtype GK f l = GK { unGK :: AppArgs f l }
+newtype GK f l = G { unG :: AppArgs f l }
 
 instance (Typeable (AppArgs f l)) => Typeable (GK f l) where
     typeOf _ = let tyCon = T.mkTyCon3 "rank1dynamic-coerce" "Data.Rank1Typeable.Coerce" "GK"
@@ -119,21 +140,23 @@ type G2 (a :: * -> * -> *) b c = GK a '[b, c]
 
 data Nat = Zer | Suc Nat
 
--- carry
+-- Carries a type of any kind
 data C k
 
+-- Applies a (* -> * -> ...) ty con to the arguments
 type family AppArgs (f :: k) (as :: [*]) :: *
 type instance AppArgs f '[] = f
 type instance AppArgs f (a ': as) = AppArgs (f a) as
 
-type family Hey a :: Constraint
-type instance Hey (a -> b) = Show a
-
+-- Type level concatenation
 type family Concat (fss :: [[k]]) :: [k]
 type instance Concat '[] = '[]
 type instance Concat ('[] ': fss) = Concat fss
 type instance Concat ((f ': fs) ': fss) = f ': Concat (fs ': fss)
 
+-- Given a ground type f and a polymorphic type g this generates a list of pairs, each of which is either
+-- (TypVar n, a) that associates a ground ANYK with a (potentially) polymorphic type. Later if we have two pairs (n, a) (m, b) and n = m then we will generate an (a ~ b) constraint, as those two polymorphic types should be the same
+-- (C ty, a) that associates some type with another. This will simply generate a (ty ~ a) constraint
 type family CollectTys (f :: *) (g :: *) :: [(*, *)]
 type instance CollectTys (a -> b) (c -> d) = Concat [(CollectTys a c), (CollectTys b d)]
 type instance CollectTys (TypVar n) a = '[ '(TypVar n, a) ]
@@ -177,7 +200,7 @@ type instance NatEq (Succ n) (Succ m) = NatEq n m
 type family PolyConstraints n a (tys :: [(*, *)]) :: Constraint
 type instance PolyConstraints n a '[] = ()
 type instance PolyConstraints n a ('(TypVar m, b) ': tys) = (If (NatEq n m) (a ~ b) (), PolyConstraints n a tys)
-type instance PolyConstraints n a ('(C tc, ty) ': tys) = PolyConstraints n a tys
+type instance PolyConstraints n a ('(C tc, ty) ': tys) = PolyConstraints n a tys -- , tc ~/~ TypVar n
 
 type family TakeAll n (tys :: [(*, *)]) :: [(*, *)]
 type instance TakeAll n '[] = '[]
@@ -186,10 +209,3 @@ type instance TakeAll n ('(C tc, a) ': tys) = ('(C tc, a) ': TakeAll n tys)
 
 class (CreateConstraints (CollectTys f g)) => PolyOf f g
 instance (CreateConstraints (CollectTys f g)) => PolyOf f g
-
--- replicate' :: G Int -> ANY -> G1 [] ANY
--- replicate' (GK 0) _ = GK []
--- replicate' (GK n) a = GK $ a : unGK (replicate' (GK (n - 1)) a)
-
--- hah :: Int -> a -> [a]
--- hah = coerceAny replicate'
